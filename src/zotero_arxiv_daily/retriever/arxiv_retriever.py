@@ -12,7 +12,7 @@ from queue import Empty
 from typing import Any, Callable, TypeVar
 from loguru import logger
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 T = TypeVar("T")
 

@@ -114,42 +114,71 @@ class ArxivRetriever(BaseRetriever):
             raise ValueError("category must be specified for arxiv.")
     
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
-        client = arxiv.Client(num_retries=10, delay_seconds=10)
-        categories = self.config.source.arxiv.category
-        include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
-        days = self.config.source.arxiv.get("days", 1)
-        
-        # Calculate date range
-        now_utc = datetime.now(timezone.utc).date()
-        end_date = now_utc - timedelta(days=1)
-        start_date = end_date - timedelta(days=days)
-        date_query = f"submittedDate:[{start_date.isoformat()} TO {end_date.isoformat()}]"
+    # 更稳健的客户端配置：小页尺寸 + 适当重试与间隔
+    client = arxiv.Client(page_size=25, num_retries=5, delay_seconds=3)
 
-        # Build category query
-        if include_cross_list:
-            cat_query = " OR ".join([f"cat:{c}" for c in categories])
-        else:
-            cat_query = " OR ".join([f"cat:{c}" for c in categories])
-            cat_query = f"({cat_query}) AND NOT (cross_list_cat:*)"
-        
-        # Combine queries
-        query_str = f"({cat_query}) AND {date_query}"
-        logger.info(f"Searching arXiv for papers from the last {days} days...")
-        logger.debug(f"Query: {query_str}")
-        
-        search = arxiv.Search(
-            query=query_str,
-            sort_by=arxiv.SortCriterion.SubmittedDate,
-            sort_order=arxiv.SortOrder.Descending,
-        )
-        
-        raw_papers = list(client.results(search))
-        
-        if self.config.executor.debug:
-            raw_papers = raw_papers[:10]
-        
-        logger.info(f"Found {len(raw_papers)} papers in the last {days} days")
-        return raw_papers
+    categories = self.config.source.arxiv.category
+    include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
+    days = int(self.config.source.arxiv.get("days", 1))
+
+    # 使用 UTC 日期，查询到昨天，避免当天/未来边界
+    end_date = (datetime.now(timezone.utc).date() - timedelta(days=1))
+    start_date = end_date - timedelta(days=max(days, 1))
+    date_query = f"submittedDate:[{start_date.isoformat()} TO {end_date.isoformat()}]"
+
+    # 类别查询与交叉列过滤（去掉 NOT 的多余括号）
+    cat_query = " OR ".join(f"cat:{c}" for c in categories)
+    if include_cross_list:
+        cat_query = f"({cat_query})"
+    else:
+        cat_query = f"({cat_query}) AND NOT cross_list_cat:*"
+
+    query_str = f"{cat_query} AND {date_query}"
+
+    def run_search(q: str, attempts=4):
+        for i in range(attempts):
+            try:
+                search = arxiv.Search(
+                    query=q,
+                    sort_by=arxiv.SortCriterion.SubmittedDate,
+                    sort_order=arxiv.SortOrder.Descending,
+                )
+                return list(client.results(search))
+            except arxiv.HTTPError:
+                # 指数退避
+                time.sleep(2 ** i)
+        # 最终失败抛出
+        raise
+
+    # 主查询
+    try:
+        raw = run_search(query_str)
+    except arxiv.HTTPError:
+        # 回退1：移除 cross_list 过滤
+        base_cat = " OR ".join(f"cat:{c}" for c in categories)
+        query_no_cross = f"({base_cat}) AND {date_query}"
+        try:
+            raw = run_search(query_no_cross)
+        except arxiv.HTTPError:
+            # 回退2：缩短日期窗口到 7 天
+            s2 = end_date - timedelta(days=7)
+            query_short = f"({base_cat}) AND submittedDate:[{s2.isoformat()} TO {end_date.isoformat()}]"
+            try:
+                raw = run_search(query_short)
+            except arxiv.HTTPError:
+                # 回退3：移除日期过滤，抓取后本地按日期筛选
+                query_latest = f"({base_cat})"
+                raw = run_search(query_latest)
+                def in_range(p):
+                    d = getattr(p, "published", None) or getattr(p, "updated", None)
+                    return d and (start_date <= d.date() <= end_date)
+                raw = [p for p in raw if in_range(p)]
+
+    # debug 截断
+    if getattr(self.config.executor, "debug", False):
+        raw = raw[:10]
+
+    return raw
 
     def convert_to_paper(self, raw_paper: ArxivResult) -> Paper:
         title = raw_paper.title

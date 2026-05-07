@@ -120,10 +120,11 @@ class ArxivRetriever(BaseRetriever):
         days = self.config.source.arxiv.get("days", 1)
         
         # Calculate date range
-        end_date = datetime.now()
+        now_utc = datetime.now(timezone.utc).date()
+        end_date = now_utc - timedelta(days=1)
         start_date = end_date - timedelta(days=days)
-        date_query = f"submittedDate:[{start_date.strftime('%Y%m%d')}+TO+{end_date.strftime('%Y%m%d')}]"
-        
+        date_query = f"submittedDate:[{start_date.isoformat()} TO {end_date.isoformat()}]"
+
         # Build category query
         if include_cross_list:
             cat_query = " OR ".join([f"cat:{c}" for c in categories])

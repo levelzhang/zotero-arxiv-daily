@@ -12,6 +12,7 @@ from queue import Empty
 from typing import Any, Callable, TypeVar
 from loguru import logger
 import requests
+from datetime import datetime, timedelta
 
 T = TypeVar("T")
 
@@ -111,34 +112,42 @@ class ArxivRetriever(BaseRetriever):
         super().__init__(config)
         if self.config.source.arxiv.category is None:
             raise ValueError("category must be specified for arxiv.")
-
+    
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
         client = arxiv.Client(num_retries=10, delay_seconds=10)
-        query = '+'.join(self.config.source.arxiv.category)
+        categories = self.config.source.arxiv.category
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
-        # Get the latest paper from arxiv rss feed
-        feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
-        if 'Feed error for query' in feed.feed.title:
-            raise Exception(f"Invalid ARXIV_QUERY: {query}.")
-        raw_papers = []
-        allowed_announce_types = {"new", "cross"} if include_cross_list else {"new"}
-        all_paper_ids = [
-            i.id.removeprefix("oai:arXiv.org:")
-            for i in feed.entries
-            if i.get("arxiv_announce_type", "new") in allowed_announce_types
-        ]
+        days = self.config.source.arxiv.get("days", 1)
+        
+        # Calculate date range
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days)
+        date_query = f"submittedDate:[{start_date.strftime('%Y%m%d')}+TO+{end_date.strftime('%Y%m%d')}]"
+        
+        # Build category query
+        if include_cross_list:
+            cat_query = " OR ".join([f"cat:{c}" for c in categories])
+        else:
+            cat_query = " OR ".join([f"cat:{c}" for c in categories])
+            cat_query = f"({cat_query}) AND NOT (cross_list_cat:*)"
+        
+        # Combine queries
+        query_str = f"({cat_query}) AND {date_query}"
+        logger.info(f"Searching arXiv for papers from the last {days} days...")
+        logger.debug(f"Query: {query_str}")
+        
+        search = arxiv.Search(
+            query=query_str,
+            sort_by=arxiv.SortCriterion.SubmittedDate,
+            sort_order=arxiv.SortOrder.Descending,
+        )
+        
+        raw_papers = list(client.results(search))
+        
         if self.config.executor.debug:
-            all_paper_ids = all_paper_ids[:10]
-
-        # Get full information of each paper from arxiv api
-        bar = tqdm(total=len(all_paper_ids))
-        for i in range(0, len(all_paper_ids), 20):
-            search = arxiv.Search(id_list=all_paper_ids[i:i + 20])
-            batch = list(client.results(search))
-            bar.update(len(batch))
-            raw_papers.extend(batch)
-        bar.close()
-
+            raw_papers = raw_papers[:10]
+        
+        logger.info(f"Found {len(raw_papers)} papers in the last {days} days")
         return raw_papers
 
     def convert_to_paper(self, raw_paper: ArxivResult) -> Paper:
